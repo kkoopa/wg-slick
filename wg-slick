@@ -1,0 +1,448 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+#
+# Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+# Copyright (C) 2025 Benjamin Byholm <bbyholm@abo.fi>.
+#
+
+set -e
+export LC_ALL=C
+
+SELF="$(readlink -f "${0}")"
+export PATH="${SELF%/*}:$PATH"
+
+WG_CONFIG=''
+INTERFACE=''
+ADDRESSES=''
+MTU=''
+DNS=''
+DNS_SEARCH=''
+TABLE=''
+PRE_UP=''
+POST_UP=''
+PRE_DOWN=''
+POST_DOWN=''
+SAVE_CONFIG=0
+CONFIG_FILE=''
+PROGRAM="${0##*/}"
+HAVE_SET_DNS=0
+HAVE_SET_FIREWALL=0
+
+cmd ( ) {
+	echo "[#] ${*}" >&2
+	"${@}"
+}
+
+die ( ) {
+	echo "$PROGRAM: ${*}" >&2
+	exit 1
+}
+
+read_bool ( ) {
+	case "${1}" in
+	true) echo 1 ;;
+	false) echo 0 ;;
+	*) die "'${1}' is neither true nor false"
+	esac
+}
+
+replace ( ) {
+	# shellcheck disable=SC2295
+	case "${1}" in
+	*${2}*) echo "${1%%${2}*}${3}${1#*${2}}" ;;
+	*) echo "${1}"
+	esac
+}
+
+replace_all ( ) {
+	set -- "${1}" "${2}" "${3}"
+
+	[ "${2}" ] || while :; do
+		if [ "${1}" ]; then
+			set -- "${1#?}" "${2}${3}${1%"${1#?}"}" "${3}"
+			continue
+		fi
+		echo "${2}${3}"
+		return
+	done
+
+	while :; do
+		case "${1}" in *${2}*)
+			# shellcheck disable=SC2295
+			set -- "${1#*${2}}" "${2}" "${3}" "${4}${1%%${2}*}${3}"
+			continue
+		esac
+		break
+	done
+
+	# shellcheck disable=SC2295
+	echo "${4}${1#*${2}}"
+}
+
+re_match ( ) {
+	set -- "$(echo "${1}" | sed -nE "s${2}p")"; [ "${1}" ] && echo "${1}"
+}
+
+parse_options ( ) {
+	INTERFACE_SECTION=0
+	CONFIG_FILE="${1}"
+	re_match "${CONFIG_FILE}" '/^[a-zA-Z0-9_=+.-]{1,15}$/\0/' >/dev/null && CONFIG_FILE="/etc/wireguard/${CONFIG_FILE}.conf"
+	[ -e "${CONFIG_FILE}" ] || die "'${CONFIG_FILE}' does not exist"
+	INTERFACE="$(re_match "${CONFIG_FILE}" ';(^|/)([a-zA-Z0-9_=+.-]{1,15})\.conf$;\2;')" || die 'The config file must be a valid interface name, followed by .conf'
+	CONFIG_FILE="$(readlink -f "${CONFIG_FILE}")"
+	[ $(( $(stat -c '0%#a' "${CONFIG_FILE}") & $(stat -c '0%#a' "${CONFIG_FILE%/*}") & 0007)) -eq 0 ] || echo "Warning: '${CONFIG_FILE}' is world accessible" >&2
+	while read -r LINE || [ -n "${LINE}" ]; do
+		NORMAL="$(echo "${LINE}" | tr '[:upper:]' '[:lower:]')"
+		STRIPPED="${NORMAL%%\#*}"
+		KEY="${STRIPPED%%=*}"; KEY="${KEY##*([:space:])}"; KEY="${KEY%%*([:space:])}"
+		VALUE="${STRIPPED#*=}"; VALUE="${VALUE##*([:space:])}"; VALUE="${VALUE%%*([:space:])}"
+		case "${KEY}" in
+		\[interface\]) INTERFACE_SECTION=1; ;;
+		\[*) INTERFACE_SECTION=0; ;;
+		esac
+		if [ ${INTERFACE_SECTION} -eq 1 ]; then
+			case "${KEY}" in
+			address) ADDRESSES="${ADDRESSES} $(replace_all "${VALUE}" ',' ' ')"; continue ;;
+			mtu) MTU="${VALUE}"; continue ;;
+			dns) for V in $(replace_all "${VALUE}" ',' ' '); do
+				{ re_match "${V}" '/(^[0-9.]+$)|(^.*:.*$)/\0/' >/dev/null; } && DNS="${DNS} ${V}" || DNS_SEARCH="${DNS_SEARCH} ${V}"
+			done; continue ;;
+			table) TABLE="${VALUE}"; continue ;;
+			preup) PRE_UP="${PRE_UP} ${VALUE}"; continue ;;
+			predown) PRE_DOWN="${PRE_DOWN} ${VALUE}"; continue ;;
+			postup) POST_UP="${POST_UP} ${VALUE}"; continue ;;
+			postdown) POST_DOWN="${POST_DOWN} ${VALUE}"; continue ;;
+			saveconfig) SAVE_CONFIG=$(read_bool "${VALUE}"); continue ;;
+			esac
+		fi
+		WG_CONFIG="${WG_CONFIG}${LINE}
+"
+	done < "${CONFIG_FILE}"
+}
+
+resolvconf_iface_prefix ( ) {
+	[ -f '/etc/resolvconf/interface-order' ] || return 0
+	while read -r IFACE; do
+		IFACE="$(re_match "${IFACE}" '/^([A-Za-z0-9-]+)\*$/\1/')" || continue
+		echo "${IFACE}." && return 0
+	done < /etc/resolvconf/interface-order
+}
+
+
+set_dns ( ) {
+	[ -n "${DNS}" ] || return 0
+	{ printf 'nameserver%s\n' "${DNS}"
+	  [ -z "${DNS_SEARCH}" ] || printf 'search%s\n' "${DNS_SEARCH}"
+	} | cmd resolvconf -a "$(resolvconf_iface_prefix)${INTERFACE}" -m 0 -x
+	HAVE_SET_DNS=1
+}
+
+unset_dns ( ) {
+	[ -n "${DNS}" ] || return 0
+	cmd resolvconf -d "$(resolvconf_iface_prefix)${INTERFACE}" -f
+}
+
+get_fwmark ( ) {
+	FWMARK="$(wg show "${INTERFACE}" fwmark)" || return 1
+	[ -n "${FWMARK}" ] && [ "${FWMARK}" != 'off' ] || return 1
+	printf '%d' "${FWMARK}"
+}
+
+add_if ( ) {
+	cmd ip link add "${INTERFACE}" type wireguard || exit
+}
+
+del_if ( ) {
+	[ ${HAVE_SET_DNS} -eq 0 ] || unset_dns
+	[ ${HAVE_SET_FIREWALL} -eq 0 ] || remove_firewall
+	if [ -z "${TABLE}" ] || [ "${TABLE}" = 'auto' ] && TBL=$(get_fwmark) && re_match "$(wg show "${INTERFACE}" allowed-ips)" ';/0( |$\n|$);\0;' >/dev/null; then
+		while { case "$(ip -4 rule show 2>/dev/null)" in *"lookup ${TBL}"*) true ;; *) false ;; esac; }; do
+			cmd ip -4 rule delete table "${TBL}"
+		done
+		while { case "$(ip -4 rule show 2>/dev/null)" in *"from all lookup main suppress_prefixlength 0"*) true ;; *) false ;; esac; }; do
+			cmd ip -4 rule delete table main suppress_prefixlength 0
+		done
+		while { case "$(ip -6 rule show 2>/dev/null)" in *"lookup ${TBL}"*) true ;; *) false ;; esac; }; do
+			cmd ip -6 rule delete table "${TBL}"
+		done
+		while { case "$(ip -6 rule show 2>/dev/null)" in *"from all lookup main suppress_prefixlength 0"*) true ;; *) false ;; esac; }; do
+			cmd ip -6 rule delete table main suppress_prefixlength 0
+		done
+	fi
+	cmd ip link delete dev "${INTERFACE}"
+}
+
+add_addr ( ) {
+	PROTO='-4'
+	case "${1}" in *':'*) PROTO='-6' ;; esac
+	cmd ip "${PROTO}" address add "${1}" dev "${INTERFACE}"
+}
+
+set_mtu_up ( ) {
+	PREV=0
+	if [ -n "${MTU}" ]; then
+		cmd ip link set mtu "${MTU}" up dev "${INTERFACE}"
+		return
+	fi
+	while read -r _ ENDPOINT; do
+		ENDPOINT="$(re_match "${ENDPOINT}" '/^\[?([a-z0-9:.]+)\]?:[0-9]+$/\1/')" || continue
+		OUTPUT="$(ip route get "${ENDPOINT}" || true)"
+		MTUL=$(re_match "${OUTPUT}" '/mtu ([0-9]+)/\1/' || { DEV="$(re_match "${OUTPUT}" '/dev ([^ ]+)/\1/')" && re_match "$(ip link show dev "${DEV}")" '/mtu ([0-9]+)/\1/'; }) && [ "${MTUL}" -gt "${PREV}" ] && PREV="${MTUL}"
+	done <<-EOF
+$(wg show "${INTERFACE}" endpoints)
+EOF
+	if [ "${PREV}" -eq 0 ]; then
+		{ read -r OUTPUT || true; } <<-EOF
+$(ip route show default || true)
+EOF
+		MTUL=$(re_match "${OUTPUT}" '/mtu ([0-9]+)/\1/' || { DEV="$(re_match "${OUTPUT}" '/dev ([^ ]+)/\1/')" && re_match "$(ip link show dev "${DEV}")" '/mtu ([0-9]+)/\1/'; }) && [ "${MTUL}" -gt "${PREV}" ] && PREV="${MTUL}"
+	fi
+	[ "${PREV}" -gt 0 ] || PREV=1500
+	cmd ip link set mtu $(( PREV - 80 )) up dev "${INTERFACE}"
+}
+
+add_default ( ) {
+	if ! TBL=$(get_fwmark); then
+		TBL=51820
+		while [ -n "$(ip -4 route show table ${TBL} 2>/dev/null)" ] || [ -n "$(ip -6 route show table ${TBL} 2>/dev/null)" ]; do
+			TBL=$(( TBL + 1 ))
+		done
+		cmd wg set "${INTERFACE}" fwmark ${TBL}
+	fi
+	PROTO='-4' IPTABLES='iptables' PF='ip'
+	case "${1}" in *':'*) PROTO='-6' IPTABLES=ip6tables PF=ip6 ;; esac
+	cmd ip "${PROTO}" rule add not fwmark "${TBL}" table "${TBL}"
+	cmd ip "${PROTO}" rule add table main suppress_prefixlength 0
+	cmd ip "${PROTO}" route add "${1}" dev "${INTERFACE}" table "${TBL}"
+
+	MARKER="-m comment --comment \"wg-slick rule for ${INTERFACE}\"" RESTORE='*raw
+' NFTABLE="wg-slick-${INTERFACE}"
+	NFTCMD="$(printf '%sadd table %s %s\n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
+	NFTCMD="$(printf '%sadd chain %s %s preraw { type filter hook prerouting priority -300; }\n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
+	NFTCMD="$(printf '%sadd chain %s %s premangle { type filter hook prerouting priority -150; }\n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
+	NFTCMD="$(printf '%sadd chain %s %s postmangle { type filter hook postrouting priority -150; }\n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
+	while read -r LINE; do
+		CIDR="$(re_match "${LINE}" ';.*inet6?\ ([0-9a-f:.]+)/[0-9]+.*;\1;')" || continue
+		RESTORE="$(printf '%s-I PREROUTING ! -i %s -d %s -m addrtype ! --src-type LOCAL -j DROP %s\n' "${RESTORE}" "${INTERFACE}" "${CIDR}" "${MARKER}")"
+		NFTCMD="$(printf '%sadd rule %s %s preraw iifname != "%s" %s daddr %s fib saddr type != local drop\n' "${NFTCMD}" "${PF}" "${NFTABLE}" "${INTERFACE}" "${PF}" "${CIDR}")"
+	done <<-EOF
+$(ip -o "${PROTO}" addr show dev "${INTERFACE}" 2>/dev/null)
+EOF
+	RESTORE="$(printf '%sCOMMIT\n*mangle\n-I POSTROUTING -m mark --mark %d -p udp -j CONNMARK --save-mark %s\n-I PREROUTING -p udp -j CONNMARK --restore-mark %s\nCOMMIT\n' "${RESTORE}" "${TBL}" "${MARKER}" "${MARKER}")"
+	NFTCMD="$(printf '%sadd rule %s %s postmangle meta l4proto udp mark %d ct mark set mark \n' "${NFTCMD}" "${PF}" "${NFTABLE}" "${TBL}")"
+	NFTCMD="$(printf '%sadd rule %s %s premangle meta l4proto udp meta mark set ct mark \n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
+	[ "${PROTO}" = '-4' ] && cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1
+	if command -v nft >/dev/null; then
+		printf '%s' "${NFTCMD}" | cmd nft -f -
+	else
+		printf '%s' "${RESTORE}" | cmd ${IPTABLES}-restore -n
+	fi
+	HAVE_SET_FIREWALL=1
+	return 0
+}
+
+set_config ( ) {
+	cmd wg setconf "${INTERFACE}" '/dev/fd/3' 3<<-EOF
+${WG_CONFIG}
+EOF
+}
+
+
+add_route ( ) {
+	PROTO='-4'
+	case "${1}" in *':'*) PROTO='-6' ;; esac
+	[ "${TABLE}" != 'off' ] || return 0
+
+	if [ -n "${TABLE}" ] && [ "${TABLE}" != 'auto' ]; then
+		cmd ip "${PROTO}" route add "${1}" dev "${INTERFACE}" table "${TABLE}"
+	else
+		case "${1}" in
+		*/0) add_default "${1}"; ;;
+		*) [ -n "$(ip "${PROTO}" route show dev "${INTERFACE}" match "${1}" 2>/dev/null)" ] || cmd ip "${PROTO}" route add "${1}" dev "${INTERFACE}"; ;;
+		esac
+	fi
+}
+
+remove_firewall ( ) {
+	if command -v nft >/dev/null; then
+		while read -r TBL; do
+			case "${TBL}" in *" wg-slick-${INTERFACE}") NFTCMD="$(printf '%sdelete %s\n' "${NFTCMD}" "${TBL}")" ;; esac
+		done <<-EOF
+$(nft list tables 2>/dev/null)
+EOF
+		[ -z "${NFTCMD}" ] || printf '%s' "${NFTCMD}" | cmd nft -f -
+	fi
+	if command -v iptables >/dev/null; then
+		for IPTABLES in iptables ip6tables; do
+			RESTORE=''
+			FOUND=0
+			while read -r LINE; do
+				case "${LINE}" in
+				'*'*) continue ;;
+				'COMMIT') continue ;;
+				'-A '*"-m comment --comment \"wg-slick rule for ${INTERFACE}\""*) continue ;;
+				'-A'*) FOUND=1
+				esac
+				RESTORE="$(printf '%s%s\n' "${RESTORE}" "$(replace "${LINE}" '#-A' '-D')")"
+			done <<-EOF
+$(${IPTABLES}-save 2>/dev/null)
+EOF
+			[ ${FOUND} -ne 1 ] || printf '%s' "${RESTORE}" | cmd ${IPTABLES}-restore -n
+		done
+	fi
+}
+
+save_config ( ) {
+	ADDRESS_LIST="$(re_match "$(ip -all -brief address show dev "${INTERFACE}")" "/^${INTERFACE} + [A-Z]+ +(.+)$/\1/")" || true
+	NEW_CONFIG='[Interface]
+'
+	for ADDRESS in ${ADDRESS_LIST}; do
+		NEW_CONFIG="${NEW_CONFIG}Address = ${ADDRESS}
+"
+	done
+	while read -r ADDRESS; do
+		NAMESERVER="$(re_match "${ADDRESS}" '/^nameserver ([a-zA-Z0-9_=+:%.-]+)$/\1/')"
+		[ -n "${NAMESERVER}" ] && NEW_CONFIG="${NEW_CONFIG}DNS = ${NAMESERVER}
+"
+	done <<-EOF
+	$(resolvconf -l "$(resolvconf_iface_prefix)${INTERFACE}" 2>/dev/null || cat "/etc/resolvconf/run/interface/$(resolvconf_iface_prefix)${INTERFACE}" 2>/dev/null)
+EOF
+	[ -n "${MTU}" ] && MTUL=$(re_match "$(ip link show dev "${INTERFACE}")" '/mtu ([0-9]+)/\1/') && NEW_CONFIG="${NEW_CONFIG}MTU = ${MTUL}
+"
+	[ -n "${TABLE}" ] && NEW_CONFIG="${NEW_CONFIG}Table = ${TABLE}
+"
+	[ "${SAVE_CONFIG}" -eq 0 ] || NEW_CONFIG="${NEW_CONFIG}SaveConfig = true
+"
+	for CMD in ${PRE_UP}; do
+		NEW_CONFIG="${NEW_CONFIG}PreUp = ${CMD}
+"
+	done
+	for CMD in ${POST_UP}; do
+		NEW_CONFIG="${NEW_CONFIG}PostUp = ${CMD}
+"
+	done
+	for CMD in ${PRE_DOWN}; do
+		NEW_CONFIG="${NEW_CONFIG}PreDown = ${CMD}
+"
+	done
+	for CMD in ${POST_DOWN}; do
+		NEW_CONFIG="${NEW_CONFIG}PostDown = ${CMD}
+"
+	done
+	UMASK="$(umask)"
+	umask 077
+	CURRENT_CONFIG="$(cmd wg showconf "${INTERFACE}")"
+	trap 'rm -f "${CONFIG_FILE}.tmp"; exit' INT TERM EXIT
+	replace "${CURRENT_CONFIG}" '[Interface]
+' "${NEW_CONFIG}" >"${CONFIG_FILE}.tmp" || die 'Could not write configuration file'
+	sync "${CONFIG_FILE}.tmp"
+	mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}" || die 'Could not move configuration file'
+	trap - INT TERM EXIT
+	umask "${UMASK}"
+}
+
+execute_hooks ( ) {
+	for HOOK in "${@}"; do
+		HOOK="$(replace_all "${HOOK}" '%i' "${INTERFACE}")"
+		echo "[#] ${HOOK}" >&2
+		(eval "${HOOK}")
+	done
+}
+
+cmd_usage ( ) {
+	cat >&2 <<-_EOF
+	Usage: ${PROGRAM} [ up | down | save | strip ] [ CONFIG_FILE | INTERFACE ]
+
+	  CONFIG_FILE is a configuration file, whose filename is the interface name
+	  followed by \`.conf'. Otherwise, INTERFACE is an interface name, with
+	  configuration found at /etc/wireguard/INTERFACE.conf. It is to be readable
+	  by wg(8)'s \`setconf' sub-command, with the exception of the following additions
+	  to the [Interface] section, which are handled by ${PROGRAM}:
+
+	  - Address: may be specified one or more times and contains one or more
+	    IP addresses (with an optional CIDR mask) to be set for the interface.
+	  - DNS: an optional DNS server to use while the device is up.
+	  - MTU: an optional MTU for the interface; if unspecified, auto-calculated.
+	  - Table: an optional routing table to which routes will be added; if
+	    unspecified or \`auto', the default table is used. If \`off', no routes
+	    are added.
+	  - PreUp, PostUp, PreDown, PostDown: script snippets which will be executed
+	    by bash(1) at the corresponding phases of the link, most commonly used
+	    to configure DNS. The string \`%i' is expanded to INTERFACE.
+	  - SaveConfig: if set to \`true', the configuration is saved from the current
+	    state of the interface upon shutdown.
+	_EOF
+}
+
+cmd_up ( ) {
+	[ -z "$(ip link show dev "${INTERFACE}" 2>/dev/null)" ] || die "'${INTERFACE}' already exists"
+	trap 'del_if; exit' INT TERM EXIT
+	add_if
+	# shellcheck disable=SC2086
+	execute_hooks ${PRE_UP}
+	set_config
+	for I in ${ADDRESSES}; do
+		add_addr "${I}"
+	done
+	set_mtu_up
+	set_dns
+	for I in $({ while read -r _ J; do for K in ${J}; do re_match "${K}" ';^[0-9a-z:.]+/[0-9]+$;\0;' >/dev/null && echo "${K}"; done; done | sort -nr -k2 -t/; }<<-EOF
+$(wg show "${INTERFACE}" allowed-ips)
+EOF
+	); do
+		add_route "${I}"
+	done
+	# shellcheck disable=SC2086
+	execute_hooks ${POST_UP}
+	trap - INT TERM EXIT
+}
+
+cmd_down ( ) {
+	case " $(wg show interfaces) " in
+	*" ${INTERFACE} "*)
+		# shellcheck disable=SC2086
+		execute_hooks ${PRE_DOWN}
+		[ "${SAVE_CONFIG}" -eq 0 ] || save_config
+		del_if
+		unset_dns || true
+		remove_firewall || true
+		# shellcheck disable=SC2086
+		execute_hooks ${POST_DOWN}
+		;;
+	*) die "'${INTERFACE}' is not a WireGuard interface"; ;;
+	esac
+}
+
+cmd_save ( ) {
+	case " $(wg show interfaces) " in
+	*" ${INTERFACE} "*) save_config ;;
+	*) die "'${INTERFACE}' is not a WireGuard interface"
+	esac
+}
+
+cmd_strip ( ) {
+	echo "${WG_CONFIG}"
+}
+
+# ~~ function override insertion point ~~
+
+if [ ${#} -eq 1 ] && { [ "${1}" = '--help' ] || [ "${1}" = '-h' ] || [ "${1}" = 'help' ]; }; then
+	cmd_usage
+elif [ ${#} -eq 2 ] && [ "${1}" = 'up' ]; then
+	parse_options "${2}"
+	cmd_up
+elif [ ${#} -eq 2 ] && [ "${1}" = 'down' ]; then
+	parse_options "${2}"
+	cmd_down
+elif [ ${#} -eq 2 ] && [ "${1}" = 'save' ]; then
+	parse_options "${2}"
+	cmd_save
+elif [ ${#} -eq 2 ] && [ "${1}" = 'strip' ]; then
+	parse_options "${2}"
+	cmd_strip
+else
+	cmd_usage
+	exit 1
+fi
+
+exit 0
