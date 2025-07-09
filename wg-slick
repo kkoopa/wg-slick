@@ -86,9 +86,9 @@ re_match ( ) {
 parse_options ( ) {
 	INTERFACE_SECTION=0
 	CONFIG_FILE="${1}"
-	re_match "${CONFIG_FILE}" '/^[a-zA-Z0-9_=+.-]{1,15}$/\0/' >/dev/null && CONFIG_FILE="/etc/wireguard/${CONFIG_FILE}.conf"
+	re_match "${CONFIG_FILE}" '/^([a-zA-Z0-9_=+.-]{1,15})$/\1/' >/dev/null && CONFIG_FILE="/etc/wireguard/${CONFIG_FILE}.conf"
 	[ -e "${CONFIG_FILE}" ] || die "'${CONFIG_FILE}' does not exist"
-	INTERFACE="$(re_match "${CONFIG_FILE}" ';(^|/)([a-zA-Z0-9_=+.-]{1,15})\.conf$;\2;')" || die 'The config file must be a valid interface name, followed by .conf'
+	INTERFACE="$(re_match "${CONFIG_FILE}" ';(^|.*/)([a-zA-Z0-9_=+.-]{1,15})\.conf$;\2;')" || die 'The config file must be a valid interface name, followed by .conf'
 	CONFIG_FILE="$(readlink -f "${CONFIG_FILE}")"
 	[ $(( $(stat -c '0%#a' "${CONFIG_FILE}") & $(stat -c '0%#a' "${CONFIG_FILE%/*}") & 0007)) -eq 0 ] || echo "Warning: '${CONFIG_FILE}' is world accessible" >&2
 	while read -r LINE || [ -n "${LINE}" ]; do
@@ -105,7 +105,7 @@ parse_options ( ) {
 			address) ADDRESSES="${ADDRESSES} $(replace_all "${VALUE}" ',' ' ')"; continue ;;
 			mtu) MTU="${VALUE}"; continue ;;
 			dns) for V in $(replace_all "${VALUE}" ',' ' '); do
-				{ re_match "${V}" '/(^[0-9.]+$)|(^.*:.*$)/\0/' >/dev/null; } && DNS="${DNS} ${V}" || DNS_SEARCH="${DNS_SEARCH} ${V}"
+				{ re_match "${V}" '/((^[0-9.]+$)|(^.*:.*$))/\1/' >/dev/null; } && DNS="${DNS} ${V}" || DNS_SEARCH="${DNS_SEARCH} ${V}"
 			done; continue ;;
 			table) TABLE="${VALUE}"; continue ;;
 			preup) PRE_UP="${PRE_UP} ${VALUE}"; continue ;;
@@ -155,7 +155,7 @@ add_if ( ) {
 del_if ( ) {
 	[ ${HAVE_SET_DNS} -eq 0 ] || unset_dns
 	[ ${HAVE_SET_FIREWALL} -eq 0 ] || remove_firewall
-	if [ -z "${TABLE}" ] || [ "${TABLE}" = 'auto' ] && TBL=$(get_fwmark) && re_match "$(wg show "${INTERFACE}" allowed-ips)" ';/0( |$\n|$);\0;' >/dev/null; then
+	if [ -z "${TABLE}" ] || [ "${TABLE}" = 'auto' ] && TBL=$(get_fwmark) && re_match "$(wg show "${INTERFACE}" allowed-ips)" ';(/0( |$\n|$));\1;' >/dev/null; then
 		while { case "$(ip -4 rule show 2>/dev/null)" in *"lookup ${TBL}"*) true ;; *) false ;; esac; }; do
 			cmd ip -4 rule delete table "${TBL}"
 		done
@@ -386,7 +386,7 @@ cmd_up ( ) {
 	done
 	set_mtu_up
 	set_dns
-	for I in $({ while read -r _ J; do for K in ${J}; do re_match "${K}" ';^[0-9a-z:.]+/[0-9]+$;\0;' >/dev/null && echo "${K}"; done; done | sort -nr -k2 -t/; }<<-EOF
+	for I in $({ while read -r _ J; do for K in ${J}; do re_match "${K}" ';^([0-9a-z:.]+/[0-9]+)$;\1;' >/dev/null && echo "${K}"; done; done | sort -nr -k2 -t/; }<<-EOF
 $(wg show "${INTERFACE}" allowed-ips)
 EOF
 	); do
