@@ -94,8 +94,8 @@ parse_options ( ) {
 	while read -r LINE || [ -n "${LINE}" ]; do
 		NORMAL="$(echo "${LINE}" | tr '[:upper:]' '[:lower:]')"
 		STRIPPED="${NORMAL%%\#*}"
-		KEY="${STRIPPED%%=*}"; KEY="${KEY##*([:space:])}"; KEY="${KEY%%*([:space:])}"
-		VALUE="${STRIPPED#*=}"; VALUE="${VALUE##*([:space:])}"; VALUE="${VALUE%%*([:space:])}"
+		KEY="${STRIPPED%%=*}"; KEY="${KEY%%"${KEY##*[^[:space:]]}"}"; KEY="${KEY##*[[:space:]]}"
+		VALUE="${STRIPPED#*=}"; VALUE="${VALUE%%"${VALUE##*[^[:space:]]}"}"; VALUE="${VALUE##*[[:space:]]}"
 		case "${KEY}" in
 		\[interface\]) INTERFACE_SECTION=1; ;;
 		\[*) INTERFACE_SECTION=0; ;;
@@ -187,7 +187,7 @@ set_mtu_up ( ) {
 	while read -r _ ENDPOINT; do
 		ENDPOINT="$(re_match "${ENDPOINT}" '/^\[?([a-z0-9:.]+)\]?:[0-9]+$/\1/')" || continue
 		OUTPUT="$(ip route get "${ENDPOINT}" || true)"
-		MTUL=$(re_match "${OUTPUT}" '/mtu ([0-9]+)/\1/' || { DEV="$(re_match "${OUTPUT}" '/dev ([^ ]+)/\1/')" && re_match "$(ip link show dev "${DEV}")" '/mtu ([0-9]+)/\1/'; }) && [ "${MTUL}" -gt "${PREV}" ] && PREV="${MTUL}"
+		MTUL=$(re_match "${OUTPUT}" '/.* mtu ([0-9]+).*/\1/' || { DEV="$(re_match "${OUTPUT}" '/.* dev ([^ ]+) .*/\1/')" && re_match "$(ip link show dev "${DEV}")" '/.* mtu ([0-9]+).*/\1/'; }) && [ "${MTUL}" -gt "${PREV}" ] && PREV="${MTUL}"
 	done <<-EOF
 $(wg show "${INTERFACE}" endpoints)
 EOF
@@ -195,7 +195,7 @@ EOF
 		{ read -r OUTPUT || true; } <<-EOF
 $(ip route show default || true)
 EOF
-		MTUL=$(re_match "${OUTPUT}" '/mtu ([0-9]+)/\1/' || { DEV="$(re_match "${OUTPUT}" '/dev ([^ ]+)/\1/')" && re_match "$(ip link show dev "${DEV}")" '/mtu ([0-9]+)/\1/'; }) && [ "${MTUL}" -gt "${PREV}" ] && PREV="${MTUL}"
+		MTUL=$(re_match "${OUTPUT}" '/.* mtu ([0-9]+).*/\1/' || { DEV="$(re_match "${OUTPUT}" '/.* dev ([^ ]+) .*/\1/')" && re_match "$(ip link show dev "${DEV}")" '/.* mtu ([0-9]+).*/\1/'; }) && [ "${MTUL}" -gt "${PREV}" ] && PREV="${MTUL}"
 	fi
 	[ "${PREV}" -gt 0 ] || PREV=1500
 	cmd ip link set mtu $(( PREV - 80 )) up dev "${INTERFACE}"
@@ -215,34 +215,33 @@ add_default ( ) {
 	cmd ip "${PROTO}" rule add table main suppress_prefixlength 0
 	cmd ip "${PROTO}" route add "${1}" dev "${INTERFACE}" table "${TBL}"
 
-	MARKER="-m comment --comment \"wg-slick rule for ${INTERFACE}\"" RESTORE='*raw
-' NFTABLE="wg-slick-${INTERFACE}"
-	NFTCMD="$(printf '%sadd table %s %s\n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
-	NFTCMD="$(printf '%sadd chain %s %s preraw { type filter hook prerouting priority -300; }\n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
-	NFTCMD="$(printf '%sadd chain %s %s premangle { type filter hook prerouting priority -150; }\n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
-	NFTCMD="$(printf '%sadd chain %s %s postmangle { type filter hook postrouting priority -150; }\n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
+	MARKER="-m comment --comment \"wg-slick rule for ${INTERFACE}\"" RESTORE='*raw' NFTABLE="wg-slick-${INTERFACE}"
+	NFTCMD="$(printf 'add table %s %s' "${PF}" "${NFTABLE}")"
+	NFTCMD="$(printf '%s\nadd chain %s %s preraw { type filter hook prerouting priority -300; }' "${NFTCMD}" "${PF}" "${NFTABLE}")"
+	NFTCMD="$(printf '%s\nadd chain %s %s premangle { type filter hook prerouting priority -150; }' "${NFTCMD}" "${PF}" "${NFTABLE}")"
+	NFTCMD="$(printf '%s\nadd chain %s %s postmangle { type filter hook postrouting priority -150; }' "${NFTCMD}" "${PF}" "${NFTABLE}")"
 	while read -r LINE; do
 		CIDR="$(re_match "${LINE}" ';.*inet6?\ ([0-9a-f:.]+)/[0-9]+.*;\1;')" || continue
-		RESTORE="$(printf '%s-I PREROUTING ! -i %s -d %s -m addrtype ! --src-type LOCAL -j DROP %s\n' "${RESTORE}" "${INTERFACE}" "${CIDR}" "${MARKER}")"
-		NFTCMD="$(printf '%sadd rule %s %s preraw iifname != "%s" %s daddr %s fib saddr type != local drop\n' "${NFTCMD}" "${PF}" "${NFTABLE}" "${INTERFACE}" "${PF}" "${CIDR}")"
+		RESTORE="$(printf '%s\n-I PREROUTING ! -i %s -d %s -m addrtype ! --src-type LOCAL -j DROP %s' "${RESTORE}" "${INTERFACE}" "${CIDR}" "${MARKER}")"
+		NFTCMD="$(printf '%s\nadd rule %s %s preraw iifname != "%s" %s daddr %s fib saddr type != local drop' "${NFTCMD}" "${PF}" "${NFTABLE}" "${INTERFACE}" "${PF}" "${CIDR}")"
 	done <<-EOF
 $(ip -o "${PROTO}" addr show dev "${INTERFACE}" 2>/dev/null)
 EOF
-	RESTORE="$(printf '%sCOMMIT\n*mangle\n-I POSTROUTING -m mark --mark %d -p udp -j CONNMARK --save-mark %s\n-I PREROUTING -p udp -j CONNMARK --restore-mark %s\nCOMMIT\n' "${RESTORE}" "${TBL}" "${MARKER}" "${MARKER}")"
-	NFTCMD="$(printf '%sadd rule %s %s postmangle meta l4proto udp mark %d ct mark set mark \n' "${NFTCMD}" "${PF}" "${NFTABLE}" "${TBL}")"
-	NFTCMD="$(printf '%sadd rule %s %s premangle meta l4proto udp meta mark set ct mark \n' "${NFTCMD}" "${PF}" "${NFTABLE}")"
+	RESTORE="$(printf '%s\nCOMMIT\n*mangle\n-I POSTROUTING -m mark --mark %d -p udp -j CONNMARK --save-mark %s\n-I PREROUTING -p udp -j CONNMARK --restore-mark %s\nCOMMIT\n' "${RESTORE}" "${TBL}" "${MARKER}" "${MARKER}")"
+	NFTCMD="$(printf '%s\nadd rule %s %s postmangle meta l4proto udp mark %d ct mark set mark' "${NFTCMD}" "${PF}" "${NFTABLE}" "${TBL}")"
+	NFTCMD="$(printf '%s\nadd rule %s %s premangle meta l4proto udp meta mark set ct mark' "${NFTCMD}" "${PF}" "${NFTABLE}")"
 	[ "${PROTO}" = '-4' ] && cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1
 	if command -v nft >/dev/null; then
-		printf '%s' "${NFTCMD}" | cmd nft -f -
+		printf '%s\n' "${NFTCMD}" | cmd nft -f /proc/self/fd/0
 	else
-		printf '%s' "${RESTORE}" | cmd ${IPTABLES}-restore -n
+		printf '%s\n' "${RESTORE}" | cmd ${IPTABLES}-restore -n
 	fi
 	HAVE_SET_FIREWALL=1
 	return 0
 }
 
 set_config ( ) {
-	cmd wg setconf "${INTERFACE}" '/dev/fd/3' 3<<-EOF
+	cmd wg setconf "${INTERFACE}" '/proc/self/fd/3' 3<<-EOF
 ${WG_CONFIG}
 EOF
 }
@@ -266,11 +265,11 @@ add_route ( ) {
 remove_firewall ( ) {
 	if command -v nft >/dev/null; then
 		while read -r TBL; do
-			case "${TBL}" in *" wg-slick-${INTERFACE}") NFTCMD="$(printf '%sdelete %s\n' "${NFTCMD}" "${TBL}")" ;; esac
+			case "${TBL}" in *" wg-slick-${INTERFACE}") NFTCMD="$(printf '%s\ndelete %s' "${NFTCMD}" "${TBL}")" ;; esac
 		done <<-EOF
 $(nft list tables 2>/dev/null)
 EOF
-		[ -z "${NFTCMD}" ] || printf '%s' "${NFTCMD}" | cmd nft -f -
+		[ -z "${NFTCMD}" ] || printf '%s\n' "${NFTCMD}" | cmd nft -f /proc/self/fd/0
 	fi
 	if command -v iptables >/dev/null; then
 		for IPTABLES in iptables ip6tables; do
