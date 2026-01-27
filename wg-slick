@@ -96,6 +96,7 @@ parse_options ( ) {
 		STRIPPED="${NORMAL%%\#*}"
 		KEY="${STRIPPED%%=*}"; KEY="${KEY%%"${KEY##*[^[:space:]]}"}"; KEY="${KEY##*[[:space:]]}"
 		VALUE="${STRIPPED#*=}"; VALUE="${VALUE%%"${VALUE##*[^[:space:]]}"}"; VALUE="${VALUE##*[[:space:]]}"
+		UNSTRIPPED_VALUE="${LINE#*=}"; UNSTRIPPED_VALUE="${UNSTRIPPED_VALUE%%"${UNSTRIPPED_VALUE##*[^[:space:]]}"}"; UNSTRIPPED_VALUE="${UNSTRIPPED_VALUE#*[[:space:]]}"
 		case "${KEY}" in
 		\[interface\]) INTERFACE_SECTION=1; ;;
 		\[*) INTERFACE_SECTION=0; ;;
@@ -108,10 +109,10 @@ parse_options ( ) {
 				{ re_match "${V}" '/((^[0-9.]+$)|(^.*:.*$))/\1/' >/dev/null; } && DNS="${DNS} ${V}" || DNS_SEARCH="${DNS_SEARCH} ${V}"
 			done; continue ;;
 			table) TABLE="${VALUE}"; continue ;;
-			preup) PRE_UP="${PRE_UP} ${VALUE}"; continue ;;
-			predown) PRE_DOWN="${PRE_DOWN} ${VALUE}"; continue ;;
-			postup) POST_UP="${POST_UP} ${VALUE}"; continue ;;
-			postdown) POST_DOWN="${POST_DOWN} ${VALUE}"; continue ;;
+			preup) PRE_UP="${PRE_UP} ${UNSTRIPPED_VALUE};"; continue ;;
+			predown) PRE_DOWN="${PRE_DOWN} ${UNSTRIPPED_VALUE};"; continue ;;
+			postup) POST_UP="${POST_UP} ${UNSTRIPPED_VALUE};"; continue ;;
+			postdown) POST_DOWN="${POST_DOWN} ${UNSTRIPPED_VALUE};"; continue ;;
 			saveconfig) SAVE_CONFIG=$(read_bool "${VALUE}"); continue ;;
 			esac
 		fi
@@ -341,11 +342,14 @@ EOF
 }
 
 execute_hooks ( ) {
-	for HOOK in "${@}"; do
+	set -- "${IFS}" "${*}"
+	IFS=';'
+	for HOOK in ${2}; do
 		HOOK="$(replace_all "${HOOK}" '%i' "${INTERFACE}")"
 		echo "[#] ${HOOK}" >&2
 		(eval "${HOOK}")
 	done
+	IFS="${1}"
 }
 
 cmd_usage ( ) {
@@ -377,8 +381,7 @@ cmd_up ( ) {
 	[ -z "$(ip link show dev "${INTERFACE}" 2>/dev/null)" ] || die "'${INTERFACE}' already exists"
 	trap 'del_if; exit' INT TERM EXIT
 	add_if
-	# shellcheck disable=SC2086
-	execute_hooks ${PRE_UP}
+	execute_hooks "${PRE_UP}"
 	set_config
 	for I in ${ADDRESSES}; do
 		add_addr "${I}"
@@ -391,22 +394,19 @@ EOF
 	); do
 		add_route "${I}"
 	done
-	# shellcheck disable=SC2086
-	execute_hooks ${POST_UP}
+	execute_hooks "${POST_UP}"
 	trap - INT TERM EXIT
 }
 
 cmd_down ( ) {
 	case " $(wg show interfaces) " in
 	*" ${INTERFACE} "*)
-		# shellcheck disable=SC2086
-		execute_hooks ${PRE_DOWN}
+		execute_hooks "${PRE_DOWN}"
 		[ "${SAVE_CONFIG}" -eq 0 ] || save_config
 		del_if
 		unset_dns || true
 		remove_firewall || true
-		# shellcheck disable=SC2086
-		execute_hooks ${POST_DOWN}
+		execute_hooks "${POST_DOWN}"
 		;;
 	*) die "'${INTERFACE}' is not a WireGuard interface"; ;;
 	esac
